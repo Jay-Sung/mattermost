@@ -4,6 +4,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -24,18 +25,27 @@ func (a *App) createDefaultChannelMemberships(c request.CTX, params model.Create
 		return appErr
 	}
 
+	var rErr error
 	for _, userChannel := range channelMembers {
 		if params.ScopedUserID != nil && *params.ScopedUserID != userChannel.UserID {
 			continue
 		}
+
+		logger := c.Logger().With(
+			mlog.String("user_id", userChannel.UserID),
+			mlog.String("channel_id", userChannel.ChannelID),
+		)
+
 		channel, err := a.GetChannel(c, userChannel.ChannelID)
 		if err != nil {
-			return err
+			rErr = errors.Join(rErr, fmt.Errorf("Failed to get channel for default channel membership: %w", err))
+			continue
 		}
 
 		tmem, err := a.GetTeamMember(c, channel.TeamId, userChannel.UserID)
 		if err != nil && err.Id != "app.team.get_member.missing.app_error" {
-			return err
+			rErr = errors.Join(rErr, fmt.Errorf("Failed to get member for default channel membership: %w", err))
+			continue
 		}
 
 		// First add user to team
@@ -43,19 +53,16 @@ func (a *App) createDefaultChannelMemberships(c request.CTX, params model.Create
 			_, err = a.AddTeamMember(c, channel.TeamId, userChannel.UserID)
 			if err != nil {
 				if err.Id == "api.team.join_user_to_team.allowed_domains.app_error" {
-					c.Logger().Info("User not added to channel - the domain associated with the user is not in the list of allowed team domains",
-						mlog.String("user_id", userChannel.UserID),
-						mlog.String("channel_id", userChannel.ChannelID),
+					logger.Info(
+						"User not added to channel - the domain associated with the user is not in the list of allowed team domains",
 						mlog.String("team_id", channel.TeamId),
 					)
-					continue
+				} else {
+					rErr = errors.Join(rErr, fmt.Errorf("Failed to add team member for default channel membership: %w", err))
 				}
-				return err
+				continue
 			}
-			c.Logger().Info("added teammember",
-				mlog.String("user_id", userChannel.UserID),
-				mlog.String("team_id", channel.TeamId),
-			)
+			logger.Info("Added channel member for default channel membership")
 		}
 
 		_, err = a.AddChannelMember(c, userChannel.UserID, channel, ChannelMemberOpts{
@@ -63,22 +70,17 @@ func (a *App) createDefaultChannelMemberships(c request.CTX, params model.Create
 		})
 		if err != nil {
 			if err.Id == "api.channel.add_user.to.channel.failed.deleted.app_error" {
-				c.Logger().Info("Not adding user to channel because they have already left the team",
-					mlog.String("user_id", userChannel.UserID),
-					mlog.String("channel_id", userChannel.ChannelID),
-				)
+				logger.Info("Not adding user to channel because they have already left the team")
 			} else {
-				return err
+				rErr = errors.Join(rErr, fmt.Errorf("Failed to add channel member for default channel membership: %w", err))
 			}
+			continue
 		}
 
-		c.Logger().Info("added channelmember",
-			mlog.String("user_id", userChannel.UserID),
-			mlog.String("channel_id", userChannel.ChannelID),
-		)
+		logger.Info("Added channel member for default channel membership")
 	}
 
-	return nil
+	return rErr
 }
 
 // createDefaultTeamMemberships adds users to teams based on their group memberships and how those groups are
@@ -92,29 +94,31 @@ func (a *App) createDefaultTeamMemberships(c request.CTX, params model.CreateDef
 		return appErr
 	}
 
+	var rErr error
 	for _, userTeam := range teamMembers {
 		if params.ScopedUserID != nil && *params.ScopedUserID != userTeam.UserID {
 			continue
 		}
-		_, err := a.AddTeamMember(c, userTeam.TeamID, userTeam.UserID)
-		if err != nil {
-			if err.Id == "api.team.join_user_to_team.allowed_domains.app_error" {
-				c.Logger().Info("User not added to team - the domain associated with the user is not in the list of allowed team domains",
-					mlog.String("user_id", userTeam.UserID),
-					mlog.String("team_id", userTeam.TeamID),
-				)
-				continue
-			}
-			return err
-		}
 
-		c.Logger().Info("added teammember",
+		logger := c.Logger().With(
 			mlog.String("user_id", userTeam.UserID),
 			mlog.String("team_id", userTeam.TeamID),
 		)
+
+		_, err := a.AddTeamMember(c, userTeam.TeamID, userTeam.UserID)
+		if err != nil {
+			if err.Id == "api.team.join_user_to_team.allowed_domains.app_error" {
+				logger.Info("User not added to team - the domain associated with the user is not in the list of allowed team domains")
+			} else {
+				rErr = errors.Join(rErr, fmt.Errorf("Failed to add team member for default team membership: %w", err))
+			}
+			continue
+		}
+
+		logger.Info("Added team member for default team membership")
 	}
 
-	return nil
+	return rErr
 }
 
 // CreateDefaultMemberships adds users to teams and channels based on their group memberships and how those groups
@@ -160,19 +164,23 @@ func (a *App) deleteGroupConstrainedTeamMemberships(c request.CTX, teamID *strin
 		return appErr
 	}
 
+	var rErr error
 	for _, userTeam := range teamMembers {
-		err := a.RemoveUserFromTeam(c, userTeam.TeamId, userTeam.UserId, "")
-		if err != nil {
-			return err
-		}
-
-		c.Logger().Info("removed teammember",
+		logger := c.Logger().With(
 			mlog.String("user_id", userTeam.UserId),
 			mlog.String("team_id", userTeam.TeamId),
 		)
+
+		err := a.RemoveUserFromTeam(c, userTeam.TeamId, userTeam.UserId, "")
+		if err != nil {
+			rErr = errors.Join(rErr, fmt.Errorf("Failed to add team member for default team membership: %w", err))
+			continue
+		}
+
+		logger.Info("Removed team member for group contrained team membership")
 	}
 
-	return nil
+	return rErr
 }
 
 // deleteGroupConstrainedChannelMemberships deletes channel memberships of users who aren't members of the allowed
@@ -184,36 +192,41 @@ func (a *App) deleteGroupConstrainedChannelMemberships(c request.CTX, channelID 
 		return appErr
 	}
 
+	var rErr error
 	for _, userChannel := range channelMembers {
+		logger := c.Logger().With(
+			mlog.String("user_id", userChannel.UserId),
+			mlog.String("channel_id", userChannel.ChannelId),
+		)
+
 		channel, err := a.GetChannel(c, userChannel.ChannelId)
 		if err != nil {
-			return err
+			rErr = errors.Join(rErr, fmt.Errorf("Failed to get channel for group contrained channel membership: %w", err))
+			continue
 		}
 
 		err = a.RemoveUserFromChannel(c, userChannel.UserId, "", channel)
 		if err != nil {
-			return err
+			rErr = errors.Join(rErr, fmt.Errorf("Failed to remove channel member for group contrained channel membership: %w", err))
+			continue
 		}
 
-		a.Log().Info("removed channelmember",
-			mlog.String("user_id", userChannel.UserId),
-			mlog.String("channel_id", channel.Id),
-		)
+		logger.Info("Removed chanel member for group contrained channel membership")
 	}
 
-	return nil
+	return rErr
 }
 
 // SyncSyncableRoles updates the SchemeAdmin field value of the given syncable's members based on the configuration of
 // the member's group memberships and the configuration of those groups to the syncable. This method should only
 // be invoked on group-synced (aka group-constrained) syncables.
-func (a *App) SyncSyncableRoles(syncableID string, syncableType model.GroupSyncableType) *model.AppError {
+func (a *App) SyncSyncableRoles(rctx request.CTX, syncableID string, syncableType model.GroupSyncableType) *model.AppError {
 	permittedAdmins, err := a.Srv().Store().Group().PermittedSyncableAdmins(syncableID, syncableType)
 	if err != nil {
 		return model.NewAppError("SyncSyncableRoles", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	a.Log().Info(
+	rctx.Logger().Info(
 		fmt.Sprintf("Permitted admins for %s", syncableType),
 		mlog.String(strings.ToLower(fmt.Sprintf("%s_id", syncableType)), syncableID),
 		mlog.Array("permitted_admins", permittedAdmins),
@@ -240,7 +253,7 @@ func (a *App) SyncSyncableRoles(syncableID string, syncableType model.GroupSynca
 // SyncRolesAndMembership updates the SchemeAdmin status and membership of all of the members of the given
 // syncable.
 func (a *App) SyncRolesAndMembership(c request.CTX, syncableID string, syncableType model.GroupSyncableType, includeRemovedMembers bool) {
-	a.SyncSyncableRoles(syncableID, syncableType)
+	a.SyncSyncableRoles(c, syncableID, syncableType)
 
 	lastJob, _ := a.Srv().Store().Job().GetNewestJobByStatusAndType(model.JobStatusSuccess, model.JobTypeLdapSync)
 	var since int64
@@ -253,15 +266,23 @@ func (a *App) SyncRolesAndMembership(c request.CTX, syncableID string, syncableT
 	switch syncableType {
 	case model.GroupSyncableTypeTeam:
 		params.ScopedTeamID = &syncableID
-		a.createDefaultTeamMemberships(c, params)
-		a.deleteGroupConstrainedTeamMemberships(c, &syncableID)
+		if err := a.createDefaultTeamMemberships(c, params); err != nil {
+			c.Logger().Warn("Error creating default team memberships", mlog.Err(err))
+		}
+		if err := a.deleteGroupConstrainedTeamMemberships(c, &syncableID); err != nil {
+			c.Logger().Warn("Error deleting group contrained team memberships", mlog.Err(err))
+		}
 		if err := a.ClearTeamMembersCache(syncableID); err != nil {
 			c.Logger().Warn("Error clearing team members cache", mlog.Err(err))
 		}
 	case model.GroupSyncableTypeChannel:
 		params.ScopedChannelID = &syncableID
-		a.createDefaultChannelMemberships(c, params)
-		a.deleteGroupConstrainedChannelMemberships(c, &syncableID)
+		if err := a.createDefaultChannelMemberships(c, params); err != nil {
+			c.Logger().Warn("Error creating default channel memberships", mlog.Err(err))
+		}
+		if err := a.deleteGroupConstrainedChannelMemberships(c, &syncableID); err != nil {
+			c.Logger().Warn("Error deleting group contrained team memberships", mlog.Err(err))
+		}
 		if err := a.ClearChannelMembersCache(c, syncableID); err != nil {
 			c.Logger().Warn("Error clearing channel members cache", mlog.Err(err))
 		}
